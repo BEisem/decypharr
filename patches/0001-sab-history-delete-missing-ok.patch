@@ -1,4 +1,4 @@
-From 849b5050f96a27ea8483d841c66e938e33f9bc0c Mon Sep 17 00:00:00 2001
+From 509401395115e7e8b3399e992dccd1eeecbc94ca Mon Sep 17 00:00:00 2001
 From: Blake Eiseman <binkatl@me.com>
 Date: Tue, 3 Nov 2026 20:26:16 -0500
 Subject: [PATCH] Treat already-deleted ids as success in SABnzbd delete
@@ -12,8 +12,9 @@ deleted, as the qBittorrent delete handler already does.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01DxiWojvaiyJ36fq7Q36gdG
 ---
- pkg/server/sabnzbd/handlers.go | 23 ++++++++++++++---------
- 1 file changed, 14 insertions(+), 9 deletions(-)
+ pkg/server/sabnzbd/handlers.go    | 23 ++++++++++++++---------
+ pkg/server/sabnzbd/routes_test.go |  8 +++++---
+ 2 files changed, 19 insertions(+), 12 deletions(-)
 
 diff --git a/pkg/server/sabnzbd/handlers.go b/pkg/server/sabnzbd/handlers.go
 index be7510c..efc6eb7 100644
@@ -88,6 +89,32 @@ index be7510c..efc6eb7 100644
  	}
  	utils.JSONResponse(w, response, http.StatusOK)
  }
+diff --git a/pkg/server/sabnzbd/routes_test.go b/pkg/server/sabnzbd/routes_test.go
+index 5e0c261..cf6886a 100644
+--- a/pkg/server/sabnzbd/routes_test.go
++++ b/pkg/server/sabnzbd/routes_test.go
+@@ -126,7 +126,9 @@ func TestRouterQueueContracts(t *testing.T) {
+ 		{"one", "target", http.MethodGet, 200, true},
+ 		{"form deletion", "target", http.MethodPost, 200, true},
+ 		{"partial", "target,missing", http.MethodGet, 200, true},
+-		{"all missing", "missing", http.MethodGet, 500, false},
++		// Missing ids are a successful no-op, as in SABnzbd: Arrs retry a
++		// failed history delete forever.
++		{"all missing", "missing", http.MethodGet, 200, false},
+ 		{"empty", "", http.MethodGet, 400, false},
+ 		{"cleanup failure", "target", http.MethodGet, 500, false},
+ 		{"failed category", "failed", http.MethodGet, 200, true},
+@@ -186,8 +188,8 @@ func TestRouterQueueContracts(t *testing.T) {
+ 			if got.Status != (tc.wantStatus == 200) {
+ 				t.Fatalf("response = %#v", got)
+ 			}
+-			if tc.name == "partial" && !strings.Contains(got.Error, "missing") {
+-				t.Errorf("partial failure is absent: %#v", got)
++			if (tc.name == "partial" || tc.name == "all missing") && got.Error != "" {
++				t.Errorf("missing ids reported as an error: %#v", got)
+ 			}
+ 			for i, entry := range entries {
+ 				deleted := i == 0 && tc.wantDeleted
 -- 
 2.43.0
 
