@@ -1,0 +1,215 @@
+From f6035e16a8a3824f28f2113d4fe5867ed2cfdebf Mon Sep 17 00:00:00 2001
+From: Blake Eiseman <binkatl@me.com>
+Date: Mon, 16 Nov 2026 07:16:58 -0500
+Subject: [PATCH] Keep internal records and invalid names out of FUSE listings
+
+The entries store also holds "__migration_status__". Entry iteration
+(List, ForEach, ForEachBatch, ForEachMeta) decoded it as an entry with an
+empty name, and one empty name in a FUSE readdir makes the kernel fail
+the whole listing with EIO, so __all__ could not be listed at all.
+
+Skip "__"-prefixed keys in entry iteration, as MigrateMetadata already
+does. Also skip any name the kernel rejects (empty, "."/"..", '/',
+NUL, over 1024 bytes) in Dir.Readdir, with a rate-limited warning, so
+one bad name no longer hides every other entry.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DxiWojvaiyJ36fq7Q36gdG
+---
+ pkg/mount/dfs/backend/hanwen/dir.go           | 29 +++++++++++++
+ .../dfs/backend/hanwen/dirent_name_test.go    | 23 ++++++++++
+ pkg/storage/entry.go                          | 20 +++++++++
+ pkg/storage/storage_test.go                   | 42 +++++++++++++++++++
+ 4 files changed, 114 insertions(+)
+ create mode 100644 pkg/mount/dfs/backend/hanwen/dirent_name_test.go
+
+diff --git a/pkg/mount/dfs/backend/hanwen/dir.go b/pkg/mount/dfs/backend/hanwen/dir.go
+index 821923f..71ad01d 100644
+--- a/pkg/mount/dfs/backend/hanwen/dir.go
++++ b/pkg/mount/dfs/backend/hanwen/dir.go
+@@ -5,6 +5,7 @@ package hanwen
+ import (
+ 	"context"
+ 	"path"
++	"strings"
+ 	"sync/atomic"
+ 	"syscall"
+ 	"time"
+@@ -293,6 +294,16 @@ func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+ 
+ 	fuseEntries := make([]fuse.DirEntry, 0, len(entries))
+ 	for _, info := range entries {
++		// The kernel fails the whole readdir with EIO on one name it
++		// rejects, hiding every other entry. Skip such names instead.
++		if !validDirentName(info.Name()) {
++			event := d.logger.Warn()
++			if d.rlLogger != nil {
++				event = d.rlLogger.Rate("invalid-dirent:" + d.name + ":" + truncateForLog(info.Name())).Warn()
++			}
++			event.Str("dir", d.name).Int("bytes", len(info.Name())).Str("name", truncateForLog(info.Name())).Msg("Skipping entry with a name FUSE rejects")
++			continue
++		}
+ 		mode := uint32(fuse.S_IFREG | 0644)
+ 		if info.IsDir() {
+ 			mode = fuse.S_IFDIR | 0755
+@@ -407,3 +418,21 @@ func (d *Dir) Rmdir(ctx context.Context, name string) syscall.Errno {
+ 
+ 	return 0
+ }
++
++// maxDirentName is the kernel's FUSE_NAME_MAX.
++const maxDirentName = 1024
++
++// validDirentName reports whether the kernel accepts name in a FUSE
++// directory listing: non-empty, at most 1024 bytes, no '/' or NUL, and not
++// "." or "..".
++func validDirentName(name string) bool {
++	return name != "" && name != "." && name != ".." &&
++		len(name) <= maxDirentName && !strings.ContainsAny(name, "/\x00")
++}
++
++func truncateForLog(name string) string {
++	if len(name) > 120 {
++		return name[:120] + "…"
++	}
++	return name
++}
+diff --git a/pkg/mount/dfs/backend/hanwen/dirent_name_test.go b/pkg/mount/dfs/backend/hanwen/dirent_name_test.go
+new file mode 100644
+index 0000000..cf61795
+--- /dev/null
++++ b/pkg/mount/dfs/backend/hanwen/dirent_name_test.go
+@@ -0,0 +1,23 @@
++package hanwen
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestValidDirentName(t *testing.T) {
++	for name, want := range map[string]bool{
++		"Release.Name.2024.1080p":            true,
++		"":                                   false,
++		".":                                  false,
++		"..":                                 false,
++		"AC/DC.Live":                         false,
++		"bad\x00name":                        false,
++		strings.Repeat("a", maxDirentName):   true,
++		strings.Repeat("a", maxDirentName+1): false,
++	} {
++		if got := validDirentName(name); got != want {
++			t.Errorf("validDirentName(%q) = %v, want %v", truncateForLog(name), got, want)
++		}
++	}
++}
+diff --git a/pkg/storage/entry.go b/pkg/storage/entry.go
+index 3cf63de..c1e39fa 100644
+--- a/pkg/storage/entry.go
++++ b/pkg/storage/entry.go
+@@ -106,11 +106,22 @@ func (s *Storage) Get(infohash string) (*Entry, error) {
+ 	return ProtoToEntry(&pb), nil
+ }
+ 
++// isInternalKey reports whether key holds Decypharr's own bookkeeping rather
++// than an entry. The entries store also keeps "__migration_status__"; read as
++// an entry it has an empty name, and an empty name in a FUSE directory listing
++// fails the whole readdir with EIO.
++func isInternalKey(key string) bool {
++	return strings.HasPrefix(key, "__")
++}
++
+ // List retrieves all cached entries with optional filtering
+ func (s *Storage) List(filter func(*Entry) bool) ([]*Entry, error) {
+ 	var entries []*Entry
+ 
+ 	err := s.entries.ForEach(func(key string, value []byte) error {
++		if isInternalKey(key) {
++			return nil
++		}
+ 		var pb EntryProto
+ 		if err := proto.Unmarshal(value, &pb); err != nil {
+ 			return nil
+@@ -128,6 +139,9 @@ func (s *Storage) List(filter func(*Entry) bool) ([]*Entry, error) {
+ // ForEach iterates over entries
+ func (s *Storage) ForEach(fn func(*Entry) error) error {
+ 	return s.entries.ForEach(func(key string, value []byte) error {
++		if isInternalKey(key) {
++			return nil
++		}
+ 		var pb EntryProto
+ 		if err := proto.Unmarshal(value, &pb); err != nil {
+ 			return nil
+@@ -148,6 +162,9 @@ func (s *Storage) ForEachBatch(batchSize int, fn func([]*Entry) error) error {
+ 	// before the next Unmarshal, leaving the prior entry's slice untouched).
+ 	var pb EntryProto
+ 	err := s.entries.ForEach(func(key string, value []byte) error {
++		if isInternalKey(key) {
++			return nil
++		}
+ 		proto.Reset(&pb)
+ 		if err := proto.Unmarshal(value, &pb); err != nil {
+ 			return nil
+@@ -185,6 +202,9 @@ type EntryMetaInfo struct {
+ // This is O(n) in-memory only - no disk reads, no protobuf deserialization.
+ func (s *Storage) ForEachMeta(fn func(*EntryMetaInfo) error) error {
+ 	return s.entries.ForEachMetadata(func(key string, meta *appendstore.Metadata) error {
++		if isInternalKey(key) {
++			return nil
++		}
+ 		return fn(&EntryMetaInfo{
+ 			InfoHash: key,
+ 			Name:     meta.Attribute(attributeName),
+diff --git a/pkg/storage/storage_test.go b/pkg/storage/storage_test.go
+index e21efba..71ceec6 100644
+--- a/pkg/storage/storage_test.go
++++ b/pkg/storage/storage_test.go
+@@ -90,3 +90,45 @@ func TestStartupWithoutMigrationLeavesNoBackups(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// The migration status record shares the entries store; entry iteration must
++// not surface it as an entry with an empty name.
++func TestEntryIterationSkipsInternalKeys(t *testing.T) {
++	s, err := NewStorage(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = s.Close() })
++	if err := s.AddOrUpdate(&Entry{InfoHash: "hash", Name: "folder", Files: map[string]*File{"file": {Name: "file", InfoHash: "hash", Size: 10}}}); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.SaveMigrationStatus(&SystemMigrationStatus{Completed: 1}); err != nil {
++		t.Fatal(err)
++	}
++	var metas, entries, batched int
++	if err := s.ForEachMeta(func(m *EntryMetaInfo) error {
++		if m.InfoHash != "hash" {
++			t.Errorf("ForEachMeta returned %q", m.InfoHash)
++		}
++		metas++
++		return nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.ForEach(func(e *Entry) error { entries++; return nil }); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.ForEachBatch(10, func(b []*Entry) error { batched += len(b); return nil }); err != nil {
++		t.Fatal(err)
++	}
++	listed, err := s.List(nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if metas != 1 || entries != 1 || batched != 1 || len(listed) != 1 {
++		t.Fatalf("got meta=%d each=%d batch=%d list=%d, want 1 each", metas, entries, batched, len(listed))
++	}
++	if status, err := s.GetMigrationStatus(); err != nil || status.Completed != 1 {
++		t.Fatalf("migration status lost: %v, %v", status, err)
++	}
++}
+-- 
+2.43.0
+

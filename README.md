@@ -1,11 +1,12 @@
 # Decypharr, patched
 
-Upstream [sirrobot01/decypharr](https://github.com/sirrobot01/decypharr) plus two fixes that aren't merged yet:
+Upstream [sirrobot01/decypharr](https://github.com/sirrobot01/decypharr) plus fixes that aren't merged yet:
 
 | Patch | Fixes |
 |---|---|
 | `patches/0001-sab-history-delete-missing-ok.patch` | [#474](https://github.com/sirrobot01/decypharr/issues/474): SABnzbd history delete of an already-gone item returns HTTP 500, so Arrs retry every minute |
 | `patches/0002-sanitize-entry-errors.patch` | [#475](https://github.com/sirrobot01/decypharr/issues/475): raw RAR header bytes (NUL) in `fail_message` break the Arr blocklist on PostgreSQL |
+| `patches/0003-skip-internal-entries-and-invalid-dirent-names.patch` | Not filed yet: the internal `__migration_status__` record shows up as an entry with an empty name, so listing `__all__` fails with `Input/output error`. Also skips any other name the kernel rejects. |
 
 ## How it works
 
