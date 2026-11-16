@@ -1,0 +1,196 @@
+From eaeaa1767e57cb6f112edbfc3ea1f7e32c679d34 Mon Sep 17 00:00:00 2001
+From: Blake Eiseman <binkatl@me.com>
+Date: Tue, 3 Nov 2026 20:26:49 -0500
+Subject: [PATCH] Strip NUL and control characters from stored entry errors
+
+Archive filenames were formatted with %s in RAR and RAR-in-7z segment
+errors, so raw header bytes (including NUL) reached Entry.LastError and
+the SABnzbd fail_message. Arrs on PostgreSQL then fail to insert the
+blocklist row and grab the same release again.
+
+Quote those names with %q, and sanitize every message in MarkAsError:
+invalid UTF-8 becomes U+FFFD, control characters become spaces, and
+the length is capped at 1024 runes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DxiWojvaiyJ36fq7Q36gdG
+---
+ pkg/storage/types.go      | 33 ++++++++++++++++++++++++++++++++-
+ pkg/storage/types_test.go | 31 ++++++++++++++++++++++++++++++-
+ pkg/usenet/parser/7z.go   |  6 +++---
+ pkg/usenet/parser/rar.go  |  8 ++++----
+ 4 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/pkg/storage/types.go b/pkg/storage/types.go
+index 3509b28..60caed4 100644
+--- a/pkg/storage/types.go
++++ b/pkg/storage/types.go
+@@ -5,7 +5,9 @@ import (
+ 	"math"
+ 	"path"
+ 	"path/filepath"
++	"strings"
+ 	"time"
++	"unicode"
+ 
+ 	"github.com/sirrobot01/decypharr/internal/config"
+ 	"github.com/sirrobot01/decypharr/internal/utils"
+@@ -421,13 +423,42 @@ func (e *Entry) MarkAsError(err error) {
+ 	e.State = EntryStateError
+ 	e.Status = debridTypes.TorrentStatusError
+ 	e.IsDownloading = false
+-	e.LastError = err.Error()
++	e.LastError = sanitizeErrorMessage(err.Error())
+ 	e.ErrorCount++
+ 	now := time.Now()
+ 	e.LastErrorTime = &now
+ 	e.UpdatedAt = now
+ }
+ 
++// maxErrorMessageRunes caps a stored error message. Parser errors can quote
++// archive bytes, and the message is shown in the UI and sent to Arrs.
++const maxErrorMessageRunes = 1024
++
++// sanitizeErrorMessage makes an error message safe to store and pass on.
++// Errors from archive parsing can carry raw bytes, including NUL. Arrs copy
++// SABnzbd's fail_message into their database, and PostgreSQL rejects NUL in
++// text columns, so the Arr's blocklist insert fails and it grabs the same
++// release again. Invalid UTF-8 becomes U+FFFD and control characters become
++// spaces.
++func sanitizeErrorMessage(msg string) string {
++	msg = strings.ToValidUTF8(msg, "\uFFFD")
++	var b strings.Builder
++	b.Grow(len(msg))
++	n := 0
++	for _, r := range msg {
++		if n == maxErrorMessageRunes {
++			b.WriteString("…")
++			break
++		}
++		if unicode.IsControl(r) {
++			r = ' '
++		}
++		b.WriteRune(r)
++		n++
++	}
++	return b.String()
++}
++
+ func (e *Entry) GetFile(filename string) (*File, error) {
+ 	if e.Files == nil {
+ 		return nil, fmt.Errorf("failed to get entry file, files is nil")
+diff --git a/pkg/storage/types_test.go b/pkg/storage/types_test.go
+index 6f65955..90bcd93 100644
+--- a/pkg/storage/types_test.go
++++ b/pkg/storage/types_test.go
+@@ -1,6 +1,11 @@
+ package storage
+ 
+-import "testing"
++import (
++	"errors"
++	"strings"
++	"testing"
++	"unicode/utf8"
++)
+ 
+ func TestGetFirstFileReturnsOnlyActiveFiles(t *testing.T) {
+ 	active := &File{Name: "active"}
+@@ -13,3 +18,27 @@ func TestGetFirstFileReturnsOnlyActiveFiles(t *testing.T) {
+ 		t.Fatalf("active file: got %v, %v", file, err)
+ 	}
+ }
++
++func TestMarkAsErrorSanitizesMessage(t *testing.T) {
++	entry := &Entry{}
++	entry.MarkAsError(errors.New("bad header \x00\x1a\xff\xfeRar!\x00 end"))
++	if strings.ContainsRune(entry.LastError, 0) {
++		t.Fatalf("LastError contains NUL: %q", entry.LastError)
++	}
++	if !utf8.ValidString(entry.LastError) {
++		t.Fatalf("LastError is not valid UTF-8: %q", entry.LastError)
++	}
++	if !strings.HasPrefix(entry.LastError, "bad header ") || !strings.HasSuffix(entry.LastError, " end") {
++		t.Fatalf("readable text lost: %q", entry.LastError)
++	}
++}
++
++func TestSanitizeErrorMessageTruncates(t *testing.T) {
++	got := sanitizeErrorMessage(strings.Repeat("é", maxErrorMessageRunes+50))
++	if n := utf8.RuneCountInString(got); n != maxErrorMessageRunes+1 {
++		t.Fatalf("got %d runes, want %d", n, maxErrorMessageRunes+1)
++	}
++	if plain := "failed to process nzb: missing articles"; sanitizeErrorMessage(plain) != plain {
++		t.Fatalf("plain message changed")
++	}
++}
+diff --git a/pkg/usenet/parser/7z.go b/pkg/usenet/parser/7z.go
+index fa1d07e..f1ee53f 100644
+--- a/pkg/usenet/parser/7z.go
++++ b/pkg/usenet/parser/7z.go
+@@ -313,7 +313,7 @@ func (p *SevenZParser) buildSegmentsForRARFile(
+ 	segmentIndex *segmentLayout,
+ ) ([]storage.NZBSegment, error) {
+ 	if len(rarEntry.VolumeParts) == 0 {
+-		return nil, fmt.Errorf("no volume parts for file %s", rarEntry.Name)
++		return nil, fmt.Errorf("no volume parts for file %q", rarEntry.Name)
+ 	}
+ 
+ 	var fileSegments []storage.NZBSegment
+@@ -329,7 +329,7 @@ func (p *SevenZParser) buildSegmentsForRARFile(
+ 		rarVolumeName := filepath.Base(part.Name)
+ 		rarVolumeOffset, ok := rarFileOffsets[rarVolumeName]
+ 		if !ok {
+-			return nil, fmt.Errorf("RAR part %q for %s is absent from the 7z file list", part.Name, rarEntry.Name)
++			return nil, fmt.Errorf("RAR part %q for %q is absent from the 7z file list", part.Name, rarEntry.Name)
+ 		}
+ 
+ 		// The file data starts at: rarVolumeOffset (in 7z) + part.DataOffset (in RAR volume)
+@@ -342,7 +342,7 @@ func (p *SevenZParser) buildSegmentsForRARFile(
+ 		}
+ 
+ 		if len(partSegments) == 0 {
+-			return nil, fmt.Errorf("RAR part %d of %s has no source segments", partIdx, rarEntry.Name)
++			return nil, fmt.Errorf("RAR part %d of %q has no source segments", partIdx, rarEntry.Name)
+ 		}
+ 
+ 		// Assign output-file positions cumulatively across parts (same
+diff --git a/pkg/usenet/parser/rar.go b/pkg/usenet/parser/rar.go
+index 5c77883..e790c0e 100644
+--- a/pkg/usenet/parser/rar.go
++++ b/pkg/usenet/parser/rar.go
+@@ -982,7 +982,7 @@ func (p *RARParser) buildSegmentsForFile(
+ 	volumeOffsetMap map[int]int64,
+ ) ([]storage.NZBSegment, error) {
+ 	if len(rarFile.VolumeParts) == 0 {
+-		return nil, fmt.Errorf("no volume parts for file %s", rarFile.Name)
++		return nil, fmt.Errorf("no volume parts for file %q", rarFile.Name)
+ 	}
+ 
+ 	// Ensure volume parts are ordered by volume index and data offset.
+@@ -1019,11 +1019,11 @@ func (p *RARParser) buildSegmentsForFile(
+ 		// part.UnpackedSize = how many bytes of the file are in this part (this is what we stream!)
+ 		partSegments, err := p.buildSegmentsForIndexedVolumePart(part, segmentIndex, volumeOffsetMap)
+ 		if err != nil {
+-			return nil, fmt.Errorf("map volume part %d of %s: %w", part.PartNumber, rarFile.Name, err)
++			return nil, fmt.Errorf("map volume part %d of %q: %w", part.PartNumber, rarFile.Name, err)
+ 		}
+ 
+ 		if len(partSegments) == 0 {
+-			return nil, fmt.Errorf("volume part %d of %s has no source segments", part.PartNumber, rarFile.Name)
++			return nil, fmt.Errorf("volume part %d of %q has no source segments", part.PartNumber, rarFile.Name)
+ 		}
+ 
+ 		// Append with correct file offsets
+@@ -1036,7 +1036,7 @@ func (p *RARParser) buildSegmentsForFile(
+ 	}
+ 
+ 	if len(fileSegments) == 0 {
+-		return nil, fmt.Errorf("no segments built for file %s", rarFile.Name)
++		return nil, fmt.Errorf("no segments built for file %q", rarFile.Name)
+ 	}
+ 
+ 	// Ensure segments are ordered by output offsets for streaming correctness.
+-- 
+2.43.0
+

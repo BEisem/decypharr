@@ -1,0 +1,134 @@
+name: Build patched Decypharr
+
+# Builds upstream's latest stable release (sirrobot01/decypharr) plus the
+# patches in patches/, and pushes ghcr.io/<owner>/decypharr:<tag>-patched
+# and :latest. Runs daily; does nothing if that tag is already built.
+#
+# A patch that upstream has already merged is skipped automatically.
+# A patch that no longer applies fails the run, so GitHub emails you.
+
+on:
+  schedule:
+    - cron: '17 9 * * *'   # daily, 09:17 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (blank = latest stable)'
+        required: false
+      force:
+        description: 'Rebuild even if the image tag already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM: https://github.com/sirrobot01/decypharr
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out patches
+        uses: actions/checkout@v5
+        with:
+          path: patched
+
+      - name: Pick upstream tag
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(git ls-remote --tags --refs "$UPSTREAM" 'v*' \
+              | sed 's#.*refs/tags/##' | grep -Ev -- '-(beta|rc|alpha)' \
+              | sort -V | tail -1)
+          fi
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/decypharr"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}-patched" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: $TAG → $IMAGE:$TAG-patched"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if already built
+        id: exists
+        run: |
+          if [ "${{ github.event.inputs.force }}" != "true" ] && \
+             docker manifest inspect "${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}-patched" >/dev/null 2>&1; then
+            echo "Already built; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream and apply patches
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git clone -q --depth 50 --branch "${{ steps.tag.outputs.tag }}" "$UPSTREAM" src
+          cd src
+          git config user.name  "patched-build"
+          git config user.email "patched-build@users.noreply.github.com"
+          applied=0
+          for p in ../patched/patches/*.patch; do
+            name=$(basename "$p")
+            if git apply --check "$p" 2>/dev/null; then
+              git am -q --3way "$p"
+              echo "::notice::Applied $name"
+              applied=$((applied+1))
+            elif git apply --reverse --check "$p" 2>/dev/null; then
+              echo "::notice::$name is already in upstream ${{ steps.tag.outputs.tag }}; skipping. You can delete it from patches/."
+            else
+              echo "::error::$name no longer applies to ${{ steps.tag.outputs.tag }}. Upstream changed this code; the patch needs updating (or upstream fixed it differently)."
+              exit 1
+            fi
+          done
+          echo "Applied $applied patch(es)."
+          git log --oneline -5
+
+      - name: Set up Go
+        if: steps.exists.outputs.skip != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: Build and test
+        if: steps.exists.outputs.skip != 'true'
+        working-directory: src
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libfuse-dev
+          go build ./...
+          go test ./pkg/storage/ ./pkg/server/sabnzbd/ ./pkg/usenet/parser/
+
+      - name: Set up Buildx
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ steps.tag.outputs.version }}
+            CHANNEL=stable
+          tags: |
+            ${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}-patched
+            ${{ steps.tag.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.tag.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
