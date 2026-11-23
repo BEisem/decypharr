@@ -1,0 +1,39 @@
+# module: github.com/mnightingale/rapidyenc
+# Fix: detectFormat panics with "slice bounds out of range [1:0]" when a body line starts with '`' or a space (UU length 0).
+diff --git a/detectformat_uu_test.go b/detectformat_uu_test.go
+new file mode 100644
+index 0000000..8834eed
+--- /dev/null
++++ b/detectformat_uu_test.go
+@@ -0,0 +1,19 @@
++package rapidyenc
++
++import "testing"
++
++// A body line that starts with '`' or ' ' gives a UU length of 0.
++// detectFormat used to slice line[1:0] and panic on it.
++func TestDetectFormatZeroUULength(t *testing.T) {
++	for _, line := range []string{"`abc", " abc", "``", "  "} {
++		func() {
++			defer func() {
++				if p := recover(); p != nil {
++					t.Fatalf("detectFormat(%q) panicked: %v", line, p)
++				}
++			}()
++			r := &Response{}
++			r.detectFormat([]byte(line))
++		}()
++	}
++}
+diff --git a/response.go b/response.go
+index 688f6c3..ed41580 100644
+--- a/response.go
++++ b/response.go
+@@ -209,7 +209,7 @@ func (r *Response) detectFormat(line []byte) {
+ 		decodeUUCharWorkaround(first),
+ 		decodeUUChar(first),
+ 	} {
+-		if n < length {
++		if length < 1 || n < length {
+ 			continue
+ 		}
