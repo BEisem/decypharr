@@ -6,6 +6,12 @@ name: Build patched Decypharr
 #
 # A patch that upstream has already merged is skipped automatically.
 # A patch that no longer applies fails the run, so GitHub emails you.
+#
+# patches/deps/*.patch patch a Go dependency instead of Decypharr itself.
+# Each starts with a "# module: <module path>" line. The run copies that
+# module (the version upstream's go.mod uses) into src/third_party/, applies
+# the patch there, points go.mod at it with a replace, and runs the tests the
+# patch adds.
 
 on:
   schedule:
@@ -51,7 +57,7 @@ jobs:
           fi
           IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/decypharr"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}-patched" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}-patched.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "Upstream tag: $TAG → $IMAGE:$TAG-patched"
 
@@ -105,6 +111,54 @@ jobs:
         with:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
+
+      - name: Patch Go dependencies
+        if: steps.exists.outputs.skip != 'true'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for p in ../patched/patches/deps/*.patch; do
+            name=$(basename "$p")
+            mod=$(sed -n 's/^# module: *//p' "$p" | head -1)
+            if [ -z "$mod" ]; then
+              echo "::error::$name has no '# module: <path>' line."
+              exit 1
+            fi
+            ver=$(go list -m -f '{{.Version}}' "$mod")
+            dir="third_party/${mod##*/}"
+            if [ ! -d "$dir" ]; then
+              go mod download "$mod"
+              mkdir -p third_party
+              cp -r "$(go env GOMODCACHE)/$mod@$ver" "$dir"
+              chmod -R u+w "$dir"
+              go mod edit -replace "$mod=./$dir"
+            fi
+            if patch -d "$dir" -p1 -s --dry-run < "$p" >/dev/null 2>&1; then
+              patch -d "$dir" -p1 -s < "$p"
+              echo "::notice::Applied $name to $mod@$ver"
+            elif patch -d "$dir" -p1 -s -R --dry-run < "$p" >/dev/null 2>&1; then
+              echo "::notice::$name is already in $mod@$ver; skipping. You can delete it from patches/deps/."
+            else
+              echo "::error::$name no longer applies to $mod@$ver. The dependency changed; the patch needs updating."
+              exit 1
+            fi
+            tests=$(sed -n 's/^+func \(Test[A-Za-z0-9_]*\).*/\1/p' "$p" | paste -sd'|' -)
+            if [ -n "$tests" ]; then
+              (cd "$dir" && go test -count=1 -run "^($tests)\$" .)
+            fi
+          done
+          if [ -d third_party ]; then
+            # Upstream's Dockerfile runs `go mod download` right after copying
+            # go.mod, so the replaced module has to be in the image by then.
+            grep -q '^COPY third_party' Dockerfile || \
+              sed -i 's|^COPY go.mod go.sum ./$|COPY go.mod go.sum ./\nCOPY third_party ./third_party|' Dockerfile
+            if ! grep -q '^COPY third_party' Dockerfile; then
+              echo "::error::Couldn't add COPY third_party to the Dockerfile (upstream changed it)."
+              exit 1
+            fi
+            git diff --stat -- go.mod Dockerfile
+          fi
 
       - name: Build and test
         if: steps.exists.outputs.skip != 'true'
