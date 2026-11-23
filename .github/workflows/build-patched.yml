@@ -10,6 +10,9 @@ name: Build patched Decypharr
 on:
   schedule:
     - cron: '17 9 * * *'   # daily, 09:17 UTC
+  push:
+    branches: [patched]
+    paths: ['patches/**', '.github/workflows/build-patched.yml']
   workflow_dispatch:
     inputs:
       tag:
@@ -63,6 +66,7 @@ jobs:
         id: exists
         run: |
           if [ "${{ github.event.inputs.force }}" != "true" ] && \
+             [ "${{ github.event_name }}" != "push" ] && \
              docker manifest inspect "${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}-patched" >/dev/null 2>&1; then
             echo "Already built; nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -108,7 +112,7 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq libfuse-dev
           go build ./...
-          go test ./pkg/storage/ ./pkg/server/sabnzbd/ ./pkg/usenet/parser/ ./pkg/mount/dfs/backend/hanwen/
+          go test ./pkg/storage/ ./pkg/server/sabnzbd/ ./pkg/usenet/parser/ ./pkg/mount/dfs/backend/hanwen/ ./internal/nntp/
 
       - name: Set up Buildx
         if: steps.exists.outputs.skip != 'true'
