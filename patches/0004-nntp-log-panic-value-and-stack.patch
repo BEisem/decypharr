@@ -1,0 +1,132 @@
+From 6f557304259c4144bac58236762cf2b4f4379cbc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 15:50:25 -0500
+Subject: [PATCH] nntp: log panic value and stack
+
+safeExecute logs recovered panics with Interface("panic", r). zerolog
+marshals runtime errors such as runtime.boundsError as {}, so the log
+shows "panic={}" and nothing about what failed or where.
+
+Log the panic as text and its Go type, and attach the goroutine stack
+(captured in the deferred recover, so it includes the panic site) at
+most once every 10s so a burst of identical panics can't flood the log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DxiWohZyBFN8vNoWTQ1MCn
+---
+ internal/nntp/client.go         |  2 +-
+ internal/nntp/panic_log.go      | 30 +++++++++++++++++++
+ internal/nntp/panic_log_test.go | 52 +++++++++++++++++++++++++++++++++
+ 3 files changed, 83 insertions(+), 1 deletion(-)
+ create mode 100644 internal/nntp/panic_log.go
+ create mode 100644 internal/nntp/panic_log_test.go
+
+diff --git a/internal/nntp/client.go b/internal/nntp/client.go
+index 83d8891..62d026f 100644
+--- a/internal/nntp/client.go
++++ b/internal/nntp/client.go
+@@ -586,7 +586,7 @@ func (c *Client) safeExecute(conn *Connection, fn func(conn *Connection) error)
+ 	defer func() {
+ 		if r := recover(); r != nil {
+ 			c.logger.Error().
+-				Interface("panic", r).
++				Func(func(e *zerolog.Event) { addPanicFields(e, r) }).
+ 				Str("host", conn.address).
+ 				Msg("Recovered from panic in NNTP operation")
+ 			err = customerror.NewPanicError(r)
+diff --git a/internal/nntp/panic_log.go b/internal/nntp/panic_log.go
+new file mode 100644
+index 0000000..74984e6
+--- /dev/null
++++ b/internal/nntp/panic_log.go
+@@ -0,0 +1,30 @@
++package nntp
++
++import (
++	"fmt"
++	"runtime/debug"
++	"sync/atomic"
++	"time"
++
++	"github.com/rs/zerolog"
++)
++
++// panicStackInterval limits how often a full stack is attached to a recovered
++// NNTP panic, so a burst of identical panics can't flood the log.
++const panicStackInterval = 10 * time.Second
++
++var lastPanicStackNs atomic.Int64
++
++// addPanicFields records a recovered panic value in a readable form. zerolog's
++// Interface() marshals runtime errors (e.g. runtime.boundsError) as {}, which
++// hides what went wrong. It must be called from the deferred recover function,
++// before the stack unwinds, so debug.Stack() still includes the panic site.
++func addPanicFields(e *zerolog.Event, r any) {
++	e.Str("panic", fmt.Sprint(r)).Str("panic_type", fmt.Sprintf("%T", r))
++
++	now := time.Now().UnixNano()
++	last := lastPanicStackNs.Load()
++	if now-last >= int64(panicStackInterval) && lastPanicStackNs.CompareAndSwap(last, now) {
++		e.Str("stack", string(debug.Stack()))
++	}
++}
+diff --git a/internal/nntp/panic_log_test.go b/internal/nntp/panic_log_test.go
+new file mode 100644
+index 0000000..c773c2a
+--- /dev/null
++++ b/internal/nntp/panic_log_test.go
+@@ -0,0 +1,52 @@
++package nntp
++
++import (
++	"bytes"
++	"strings"
++	"testing"
++
++	"github.com/rs/zerolog"
++)
++
++var panicSink int
++
++func logRecovered(log zerolog.Logger, f func()) {
++	defer func() {
++		if r := recover(); r != nil {
++			log.Error().Func(func(e *zerolog.Event) { addPanicFields(e, r) }).Msg("recovered")
++		}
++	}()
++	f()
++}
++
++func TestAddPanicFieldsLogsValueAndRateLimitsStack(t *testing.T) {
++	lastPanicStackNs.Store(0)
++	var buf bytes.Buffer
++	log := zerolog.New(&buf)
++
++	logRecovered(log, func() {
++		var s []int
++		idx := 3
++		panicSink = s[idx]
++	})
++	first := buf.String()
++	if !strings.Contains(first, "index out of range") {
++		t.Fatalf("panic text missing: %s", first)
++	}
++	if !strings.Contains(first, `"panic_type":"runtime.boundsError"`) {
++		t.Fatalf("panic type missing: %s", first)
++	}
++	if !strings.Contains(first, `"stack":`) || !strings.Contains(first, "panic_log_test.go") {
++		t.Fatalf("stack missing or doesn't include the panic site: %s", first)
++	}
++
++	buf.Reset()
++	logRecovered(log, func() { panic("second") })
++	second := buf.String()
++	if !strings.Contains(second, `"panic":"second"`) {
++		t.Fatalf("second panic text missing: %s", second)
++	}
++	if strings.Contains(second, `"stack":`) {
++		t.Fatalf("stack should be rate-limited within %s: %s", panicStackInterval, second)
++	}
++}
+-- 
+2.43.0
